@@ -19,6 +19,7 @@ void printf(const char *fmt, ...) {
                     break;
                 case 's': { // 打印以 NULL 结尾的字符串
                     const char *s = va_arg(vargs, const char *);
+                    if(!s) s="(null)";
                     while (*s) {
                         putchar(*s);
                         s++;
@@ -51,6 +52,7 @@ void printf(const char *fmt, ...) {
                         unsigned nibble = (value >> (i * 4)) & 0xf;
                         putchar("0123456789abcdef"[nibble]);
                     }
+                    break;
                 }
             }
         } else {

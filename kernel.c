@@ -3,6 +3,7 @@
 
 extern char __bss[], __bss_end[], __stack_top[];
 
+void kernel_entry(void);
 // 1. SBI 调用实现
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -46,7 +47,6 @@ void kernel_main(void) {
 }
 
 // 3. 启动入口（必须包含这个！）
-__attribute__((section(".text.boot")))
 __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
@@ -124,6 +124,8 @@ void kernel_entry(void) {
         "sret\n"
     );
 }
+__attribute__((section(".text.boot")))
+__attribute__((naked))
 void boot(void) {
     __asm__ __volatile__(
         "mv sp, %[stack_top]\n"
