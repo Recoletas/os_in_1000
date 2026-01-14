@@ -1,18 +1,22 @@
 #include "common.h"
 #include "kernel.h"
 
+#define PROC_UNUSED   0   // 未使用的进程控制结构
+#define PROC_RUNNABLE 1   // 可运行的进程
+#define PROCS_MAX 8       // 最大进程数量
+
 struct process {
     int pid;             // 进程 ID
     int state;           // 进程状态: PROC_UNUSED 或 PROC_RUNNABLE
     vaddr_t sp;          // 栈指针
     uint8_t stack[8192]; // 内核栈
 };
-#define PROCS_MAX 8       // 最大进程数量
 
-#define PROC_UNUSED   0   // 未使用的进程控制结构
-#define PROC_RUNNABLE 1   // 可运行的进程
+struct process procs[PROCS_MAX];
 struct process *current_proc; // 当前运行的进程
 struct process *idle_proc;    // 空闲进程
+
+void switch_context(uint32_t *prev_sp, uint32_t *next_sp);
 
 void yield(void) {
     // 搜索可运行的进程
@@ -148,11 +152,10 @@ void putchar(char ch) {
 void kernel_main(void) { 
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
-    WRITE_CSR(stvec, (uint32_t) kernel_entry);
-
-    proc_a = create_process((uint32_t) proc_a_entry);
-    proc_b = create_process((uint32_t) proc_b_entry);
-    proc_a_entry();
+    paddr_t paddr0 = alloc_pages(2);
+    paddr_t paddr1 = alloc_pages(1);
+    printf("alloc_pages test: paddr0=%x\n", paddr0);
+    printf("alloc_pages test: paddr1=%x\n", paddr1);
    
 
     PANIC("booted!");
@@ -241,7 +244,19 @@ void kernel_entry(void) {
         "sret\n"
     );
 }
+
 __attribute__((section(".text.boot")))
+__attribute__((naked))
+void boot(void) {
+    __asm__ __volatile__(
+        "mv sp, %[stack_top]\n"
+        "j kernel_main\n"
+        :
+        : [stack_top] "r" (__stack_top)
+    );
+}
+
+
 __attribute__((naked))
 void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
@@ -282,14 +297,6 @@ void switch_context(uint32_t *prev_sp,
         "lw s11, 12 * 4(sp)\n"
         "addi sp, sp, 13 * 4\n"  // 我们已从栈中弹出13个4字节寄存器
         "ret\n"
-    );
-}
-void boot(void) {
-    __asm__ __volatile__(
-        "mv sp, %[stack_top]\n"
-        "j kernel_main\n"
-        :
-        : [stack_top] "r" (__stack_top)
     );
 }
 void handle_trap(struct trap_frame *f) {
