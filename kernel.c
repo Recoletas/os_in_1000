@@ -17,6 +17,7 @@ struct process *current_proc; // 当前运行的进程
 struct process *idle_proc;    // 空闲进程
 
 void switch_context(uint32_t *prev_sp, uint32_t *next_sp);
+void putchar(char ch);
 
 void yield(void) {
     // 搜索可运行的进程
@@ -33,16 +34,20 @@ void yield(void) {
     if (next == current_proc)
         return;
 
+    __asm__ __volatile__(
+        "csrw sscratch, %[sscratch]\n"
+        :
+        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+    );
+    
     // 上下文切换
     struct process *prev = current_proc;
     current_proc = next;
     switch_context(&prev->sp, &next->sp);
 }
 
-struct process procs[PROCS_MAX]; // 所有进程控制结构
 
-void putchar(char ch);
-void switch_context(uint32_t *prev_sp, uint32_t *next_sp);
+
 
 struct process *create_process(uint32_t pc) {
     // 查找未使用的进程控制结构
@@ -109,8 +114,7 @@ void proc_a_entry(void) {
     printf("starting process A\n");
     while (1) {
         putchar('A');
-        switch_context(&proc_a->sp, &proc_b->sp);
-        delay();
+        yield();
     }
 }
 
@@ -118,8 +122,7 @@ void proc_b_entry(void) {
     printf("starting process B\n");
     while (1) {
         putchar('B');
-        switch_context(&proc_b->sp, &proc_a->sp);
-        delay();
+        yield();
     }
 }
 
@@ -152,13 +155,20 @@ void putchar(char ch) {
 void kernel_main(void) { 
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
-    paddr_t paddr0 = alloc_pages(2);
-    paddr_t paddr1 = alloc_pages(1);
-    printf("alloc_pages test: paddr0=%x\n", paddr0);
-    printf("alloc_pages test: paddr1=%x\n", paddr1);
-   
+    printf("\n\n");
 
-    PANIC("booted!");
+    WRITE_CSR(stvec, (uint32_t) kernel_entry);
+
+    idle_proc = create_process((uint32_t) NULL);
+    idle_proc->pid = 0; // idle
+    current_proc = idle_proc;
+
+    proc_a = create_process((uint32_t) proc_a_entry);
+    proc_b = create_process((uint32_t) proc_b_entry);
+    
+    yield();
+
+    PANIC("switched to idle process");
     printf("unreachable here!\n");
 
     for (;;) {
@@ -171,7 +181,8 @@ __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
     __asm__ __volatile__(
-        "csrw sscratch, sp\n"
+        "csrrw sp, sscratch, sp\n"
+
         "addi sp, sp, -4 * 31\n"
         "sw ra,  4 * 0(sp)\n"
         "sw gp,  4 * 1(sp)\n"
@@ -206,6 +217,10 @@ void kernel_entry(void) {
 
         "csrr a0, sscratch\n"
         "sw a0, 4 * 30(sp)\n"
+
+        // 重置内核栈
+        "addi a0, sp, 4 * 31\n"
+        "csrw sscratch, a0\n"
 
         "mv a0, sp\n"
         "call handle_trap\n"
