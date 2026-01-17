@@ -41,6 +41,13 @@ struct trap_frame {
     uint32_t s11;
     uint32_t sp;
 };
+struct process {
+    int pid;
+    int state;
+    vaddr_t sp;
+    uint32_t *page_table;
+    uint8_t stack[8192];
+};
 
 
 #define PANIC(fmt, ...)                                                        \

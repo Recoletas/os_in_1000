@@ -5,17 +5,15 @@
 #define PROC_RUNNABLE 1   // 可运行的进程
 #define PROCS_MAX 8       // 最大进程数量
 
-struct process {
-    int pid;             // 进程 ID
-    int state;           // 进程状态: PROC_UNUSED 或 PROC_RUNNABLE
-    vaddr_t sp;          // 栈指针
-    uint8_t stack[8192]; // 内核栈
-};
+extern char __bss[], __bss_end[], __stack_top[];
+extern char __free_ram[], __free_ram_end[];
 
 struct process procs[PROCS_MAX];
 struct process *current_proc; // 当前运行的进程
 struct process *idle_proc;    // 空闲进程
 
+paddr_t alloc_pages(uint32_t n);
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags);
 void switch_context(uint32_t *prev_sp, uint32_t *next_sp);
 void putchar(char ch);
 
@@ -35,9 +33,13 @@ void yield(void) {
         return;
 
     __asm__ __volatile__(
+        "sfence.vma\n"
+        "csrw satp, %[satp]\n"
+        "sfence.vma\n"
         "csrw sscratch, %[sscratch]\n"
         :
-        : [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
+        : [satp] "r" (SATP_SV32 | ((uint32_t) next->page_table / PAGE_SIZE)),
+          [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
     
     // 上下文切换
@@ -50,6 +52,8 @@ void yield(void) {
 
 
 struct process *create_process(uint32_t pc) {
+
+    extern char __kernel_base[];
     // 查找未使用的进程控制结构
     struct process *proc = NULL;
     int i;
@@ -80,16 +84,22 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s0
     *--sp = (uint32_t) pc;          // ra
 
+    // 映射内核页面。
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
     // 初始化字段
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
     proc->sp = (uint32_t) sp;
+    proc->page_table=page_table;
     return proc;
 }
 
 
-extern char __bss[], __bss_end[], __stack_top[];
-extern char __free_ram[], __free_ram_end[];
+
 
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
