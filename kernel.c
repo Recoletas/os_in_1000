@@ -7,6 +7,7 @@
 
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
+extern char __kernel_base[];
 
 struct process procs[PROCS_MAX];
 struct process *current_proc; // 当前运行的进程
@@ -53,7 +54,7 @@ void yield(void) {
 
 struct process *create_process(uint32_t pc) {
 
-    extern char __kernel_base[];
+    
     // 查找未使用的进程控制结构
     struct process *proc = NULL;
     int i;
