@@ -1,18 +1,14 @@
 #!/bin/bash
-set -xue
-
-# QEMU 文件路径
-QEMU=qemu-system-riscv32
-
-# clang 路径和编译器标志
 CC=clang
-CFLAGS="-std=c11 -O2 -g3 -Wall -Wextra --target=riscv32-unknown-elf -fuse-ld=lld -fno-stack-protector -ffreestanding -nostdlib"
+OBJCOPY=llvm-objcopy
+CFLAGS="-std=c11 -O2 -g3 -Wall -Wextra --target=riscv32 -ffreestanding -nostdlib -I."
 
-# 构建内核
-$CC $CFLAGS -Wl,-Tkernel.ld -Wl,-Map=kernel.map -o kernel.elf \
-    kernel.c common.c
+# Build the shell (application)
+$CC $CFLAGS -Wl,-Tuser/user.ld -Wl,-Map=user/shell.map -o user/shell.elf \
+    user/shell.c user/user.c kernel/common.c
+$OBJCOPY --set-section-flags .bss=alloc,contents -O binary user/shell.elf user/shell.bin
+$OBJCOPY -Ibinary -Oelf32-littleriscv user/shell.bin user/shell.bin.o
 
-# 启动 QEMU
-$QEMU -machine virt -bios default -nographic -serial mon:stdio --no-reboot \
-      -kernel kernel.elf \
-      -monitor telnet:127.0.0.1:1234,server,nowait
+# Build the kernel
+$CC $CFLAGS -Wl,-Tkernel/kernel.ld -Wl,-Map=kernel/kernel.map -o kernel.elf \
+    kernel/kernel.c kernel/common.c user/shell.bin.o
