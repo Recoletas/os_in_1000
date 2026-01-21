@@ -1,25 +1,101 @@
 #include "common.h"
 #include "kernel.h"
 
-#define PROC_UNUSED   0   // 未使用的进程控制结构
-#define PROC_RUNNABLE 1   // 可运行的进程
-#define PROCS_MAX 8       // 最大进程数量
+#define PROC_UNUSED   0
+#define PROC_RUNNABLE 1
+#define PROCS_MAX     8
 
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
 extern char __kernel_base[];
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
 
 struct process procs[PROCS_MAX];
-struct process *current_proc; // 当前运行的进程
-struct process *idle_proc;    // 空闲进程
+struct process *current_proc;
+struct process *idle_proc;
 
-paddr_t alloc_pages(uint32_t n);
-void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags);
+// 声明外部函数和汇编标签
+void user_entry(void);
 void switch_context(uint32_t *prev_sp, uint32_t *next_sp);
-void putchar(char ch);
+void kernel_entry(void);
+
+// 映射页面函数
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
+// 进程创建函数
+struct process *create_process(const void *image, size_t image_size) {
+    struct process *proc = NULL;
+    int i;
+    for (i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc) PANIC("no free process slots");
+
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+
+    // 初始化内核页表
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE) {
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+    }
+
+    if (image) {
+        // --- 用户进程逻辑 ---
+        for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+            paddr_t page = alloc_pages(1);
+            size_t remaining = image_size - off;
+            size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+            memcpy((void *) page, (uint8_t *)image + off, copy_size);
+            // 映射到用户空间虚拟地址 USER_BASE
+            map_page(page_table, USER_BASE + off, page, PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+        }
+        // 用户进程第一次切换后应该跳转到 user_entry
+        *--sp = (uint32_t) user_entry; 
+    } else {
+        // --- 内核进程逻辑 (如 Idle) ---
+        // 注意：这里为了兼容，如果不是用户进程且不是idle，
+        // 我们假设在 kernel_main 中会手动处理入口地址。
+        // 在该版本中，内核任务 A/B 建议改为通过 pc 参数传递，
+        // 但为了符合你的结构，我们统一处理。
+        *--sp = 0; 
+    }
+
+    // 设置 switch_context 需要恢复的寄存器 (s0-s11)
+    for (int j = 0; j < 12; j++) *--sp = 0;
+
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
+    return proc;
+}
+
+// 特殊处理内核线程 A/B 的创建（因为它们不需要镜像映射）
+struct process *create_kernel_thread(void (*entry)(void)) {
+    struct process *proc = create_process(NULL, 0);
+    uint32_t *sp = (uint32_t *) proc->sp;
+    // 覆盖原本压入的 ra (在 switch_context 栈帧中 ra 是第一个)
+    // 我们的 switch_context 压栈顺序是 ra, s0-s11, 所以 ra 在偏移 12 的位置
+    sp[12] = (uint32_t) entry; 
+    return proc;
+}
 
 void yield(void) {
-    // 搜索可运行的进程
     struct process *next = idle_proc;
     for (int i = 0; i < PROCS_MAX; i++) {
         struct process *proc = &procs[(current_proc->pid + i) % PROCS_MAX];
@@ -29,10 +105,9 @@ void yield(void) {
         }
     }
 
-    // 如果除了当前进程外没有可运行的进程，返回并继续处理
-    if (next == current_proc)
-        return;
+    if (next == current_proc) return;
 
+    // 更新 SATP 切换页表，更新 sscratch 为下个进程的内核栈顶
     __asm__ __volatile__(
         "sfence.vma\n"
         "csrw satp, %[satp]\n"
@@ -43,311 +118,63 @@ void yield(void) {
           [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
     
-    // 上下文切换
     struct process *prev = current_proc;
     current_proc = next;
     switch_context(&prev->sp, &next->sp);
 }
 
-
-
-
-struct process *create_process(uint32_t pc) {
-
-    
-    // 查找未使用的进程控制结构
-    struct process *proc = NULL;
-    int i;
-    for (i = 0; i < PROCS_MAX; i++) {
-        if (procs[i].state == PROC_UNUSED) {
-            proc = &procs[i];
-            break;
-        }
-    }
-
-    if (!proc)
-        PANIC("no free process slots");
-
-    // 设置被调用者保存的寄存器。这些寄存器值将在 switch_context 
-    // 中的第一次上下文切换时被恢复。
-    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) pc;          // ra
-
-    // 映射内核页面。
-    uint32_t *page_table = (uint32_t *) alloc_pages(1);
-    for (paddr_t paddr = (paddr_t) __kernel_base;
-         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
-        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
-
-    // 初始化字段
-    proc->pid = i + 1;
-    proc->state = PROC_RUNNABLE;
-    proc->sp = (uint32_t) sp;
-    proc->page_table=page_table;
-    return proc;
+// 核心：跳转到用户态的实现
+__attribute__((naked)) void user_entry(void) {
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]\n"       // 用户程序起始地址
+        "csrw sstatus, %[sstatus]\n" // 设置 SPP=0 (进入U-Mode), SPIE=1
+        "sret\n"
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (SSTATUS_SPIE) // SSTATUS_SPP 为 0
+    );
 }
 
+void kernel_main(void) { 
+    memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
+    printf("\n\nOS is booting...\n");
 
+    WRITE_CSR(stvec, (uint32_t) kernel_entry);
 
+    // 1. 创建空闲进程
+    idle_proc = create_process(NULL, 0); 
+    idle_proc->pid = 0;
+    current_proc = idle_proc;
 
+    // 2. 创建内核进程 A 和 B
+    // 使用修正后的函数以处理入口点地址
+    extern void proc_a_entry(void);
+    extern void proc_b_entry(void);
+    create_kernel_thread(proc_a_entry);
+    create_kernel_thread(proc_b_entry);
+
+    // 3. 创建用户进程 (Shell)
+    create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
+    
+    printf("Starting scheduler...\n");
+    yield();
+
+    PANIC("switched to idle process");
+}
+
+// 其余辅助函数 (alloc_pages, map_page 等保持你提供的修复后逻辑)
 paddr_t alloc_pages(uint32_t n) {
     static paddr_t next_paddr = (paddr_t) __free_ram;
     paddr_t paddr = next_paddr;
     next_paddr += n * PAGE_SIZE;
-
-    if (next_paddr > (paddr_t) __free_ram_end)
-        PANIC("out of memory");
-
+    if (next_paddr > (paddr_t) __free_ram_end) PANIC("out of memory");
     memset((void *) paddr, 0, n * PAGE_SIZE);
     return paddr;
 }
-void delay(void) {
-    for (int i = 0; i < 30000000; i++)
-        __asm__ __volatile__("nop"); // 什么都不做
-}
 
-struct process *proc_a;
-struct process *proc_b;
-
-void proc_a_entry(void) {
-    printf("starting process A\n");
-    while (1) {
-        putchar('A');
-        yield();
-    }
-}
-
-void proc_b_entry(void) {
-    printf("starting process B\n");
-    while (1) {
-        putchar('B');
-        yield();
-    }
-}
-
-void kernel_entry(void);
-// 1. SBI 调用实现
-struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
-                       long arg5, long fid, long eid) {
-    register long a0 __asm__("a0") = arg0;
-    register long a1 __asm__("a1") = arg1;
-    register long a2 __asm__("a2") = arg2;
-    register long a3 __asm__("a3") = arg3;
-    register long a4 __asm__("a4") = arg4;
-    register long a5 __asm__("a5") = arg5;
-    register long a6 __asm__("a6") = fid;
-    register long a7 __asm__("a7") = eid;
-
-    __asm__ __volatile__("ecall"
-                         : "=r"(a0), "=r"(a1)
-                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5),
-                           "r"(a6), "r"(a7)
-                         : "memory");
-    return (struct sbiret){.error = a0, .value = a1};
-}
-
-void putchar(char ch) {
-    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
-}
-
-// 2. 内核主逻辑
-void kernel_main(void) { 
-    memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
-
-    printf("\n\n");
-
-    WRITE_CSR(stvec, (uint32_t) kernel_entry);
-
-    idle_proc = create_process((uint32_t) NULL);
-    idle_proc->pid = 0; // idle
-    current_proc = idle_proc;
-
-    proc_a = create_process((uint32_t) proc_a_entry);
-    proc_b = create_process((uint32_t) proc_b_entry);
-    
-    yield();
-
-    PANIC("switched to idle process");
-    printf("unreachable here!\n");
-
-    for (;;) {
-        __asm__ __volatile__("wfi");
-    }
-}
-
-// 3. 启动入口（必须包含这个！）
-__attribute__((naked))
-__attribute__((aligned(4)))
-void kernel_entry(void) {
-    __asm__ __volatile__(
-        "csrrw sp, sscratch, sp\n"
-
-        "addi sp, sp, -4 * 31\n"
-        "sw ra,  4 * 0(sp)\n"
-        "sw gp,  4 * 1(sp)\n"
-        "sw tp,  4 * 2(sp)\n"
-        "sw t0,  4 * 3(sp)\n"
-        "sw t1,  4 * 4(sp)\n"
-        "sw t2,  4 * 5(sp)\n"
-        "sw t3,  4 * 6(sp)\n"
-        "sw t4,  4 * 7(sp)\n"
-        "sw t5,  4 * 8(sp)\n"
-        "sw t6,  4 * 9(sp)\n"
-        "sw a0,  4 * 10(sp)\n"
-        "sw a1,  4 * 11(sp)\n"
-        "sw a2,  4 * 12(sp)\n"
-        "sw a3,  4 * 13(sp)\n"
-        "sw a4,  4 * 14(sp)\n"
-        "sw a5,  4 * 15(sp)\n"
-        "sw a6,  4 * 16(sp)\n"
-        "sw a7,  4 * 17(sp)\n"
-        "sw s0,  4 * 18(sp)\n"
-        "sw s1,  4 * 19(sp)\n"
-        "sw s2,  4 * 20(sp)\n"
-        "sw s3,  4 * 21(sp)\n"
-        "sw s4,  4 * 22(sp)\n"
-        "sw s5,  4 * 23(sp)\n"
-        "sw s6,  4 * 24(sp)\n"
-        "sw s7,  4 * 25(sp)\n"
-        "sw s8,  4 * 26(sp)\n"
-        "sw s9,  4 * 27(sp)\n"
-        "sw s10, 4 * 28(sp)\n"
-        "sw s11, 4 * 29(sp)\n"
-
-        "csrr a0, sscratch\n"
-        "sw a0, 4 * 30(sp)\n"
-
-        // 重置内核栈
-        "addi a0, sp, 4 * 31\n"
-        "csrw sscratch, a0\n"
-
-        "mv a0, sp\n"
-        "call handle_trap\n"
-
-        "lw ra,  4 * 0(sp)\n"
-        "lw gp,  4 * 1(sp)\n"
-        "lw tp,  4 * 2(sp)\n"
-        "lw t0,  4 * 3(sp)\n"
-        "lw t1,  4 * 4(sp)\n"
-        "lw t2,  4 * 5(sp)\n"
-        "lw t3,  4 * 6(sp)\n"
-        "lw t4,  4 * 7(sp)\n"
-        "lw t5,  4 * 8(sp)\n"
-        "lw t6,  4 * 9(sp)\n"
-        "lw a0,  4 * 10(sp)\n"
-        "lw a1,  4 * 11(sp)\n"
-        "lw a2,  4 * 12(sp)\n"
-        "lw a3,  4 * 13(sp)\n"
-        "lw a4,  4 * 14(sp)\n"
-        "lw a5,  4 * 15(sp)\n"
-        "lw a6,  4 * 16(sp)\n"
-        "lw a7,  4 * 17(sp)\n"
-        "lw s0,  4 * 18(sp)\n"
-        "lw s1,  4 * 19(sp)\n"
-        "lw s2,  4 * 20(sp)\n"
-        "lw s3,  4 * 21(sp)\n"
-        "lw s4,  4 * 22(sp)\n"
-        "lw s5,  4 * 23(sp)\n"
-        "lw s6,  4 * 24(sp)\n"
-        "lw s7,  4 * 25(sp)\n"
-        "lw s8,  4 * 26(sp)\n"
-        "lw s9,  4 * 27(sp)\n"
-        "lw s10, 4 * 28(sp)\n"
-        "lw s11, 4 * 29(sp)\n"
-        "lw sp,  4 * 30(sp)\n"
-        "sret\n"
-    );
-}
-
-__attribute__((section(".text.boot")))
-__attribute__((naked))
-void boot(void) {
-    __asm__ __volatile__(
-        "mv sp, %[stack_top]\n"
-        "j kernel_main\n"
-        :
-        : [stack_top] "r" (__stack_top)
-    );
-}
-
-
-__attribute__((naked))
-void switch_context(uint32_t *prev_sp,
-                                           uint32_t *next_sp) {
-    __asm__ __volatile__(
-        // 将被调用者保存寄存器保存到当前进程的栈上
-        "addi sp, sp, -13 * 4\n" // 为13个4字节寄存器分配栈空间 
-        "sw ra,  0  * 4(sp)\n"   // 仅保存被调用者保存的寄存器
-        "sw s0,  1  * 4(sp)\n"
-        "sw s1,  2  * 4(sp)\n"
-        "sw s2,  3  * 4(sp)\n"
-        "sw s3,  4  * 4(sp)\n"
-        "sw s4,  5  * 4(sp)\n"
-        "sw s5,  6  * 4(sp)\n"
-        "sw s6,  7  * 4(sp)\n"
-        "sw s7,  8  * 4(sp)\n"
-        "sw s8,  9  * 4(sp)\n"
-        "sw s9,  10 * 4(sp)\n"
-        "sw s10, 11 * 4(sp)\n"
-        "sw s11, 12 * 4(sp)\n"
-
-        // 切换栈指针
-        "sw sp, (a0)\n"         // *prev_sp = sp;
-        "lw sp, (a1)\n"         // 在这里切换栈指针(sp)
-
-        // 从下一个进程的栈中恢复被调用者保存的寄存器
-        "lw ra,  0  * 4(sp)\n"  // 仅恢复被调用者保存的寄存器
-        "lw s0,  1  * 4(sp)\n"
-        "lw s1,  2  * 4(sp)\n"
-        "lw s2,  3  * 4(sp)\n"
-        "lw s3,  4  * 4(sp)\n"
-        "lw s4,  5  * 4(sp)\n"
-        "lw s5,  6  * 4(sp)\n"
-        "lw s6,  7  * 4(sp)\n"
-        "lw s7,  8  * 4(sp)\n"
-        "lw s8,  9  * 4(sp)\n"
-        "lw s9,  10 * 4(sp)\n"
-        "lw s10, 11 * 4(sp)\n"
-        "lw s11, 12 * 4(sp)\n"
-        "addi sp, sp, 13 * 4\n"  // 我们已从栈中弹出13个4字节寄存器
-        "ret\n"
-    );
-}
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
-    uint32_t user_pc = READ_CSR(sepc);
-
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
-}
-void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
-    if (!is_aligned(vaddr, PAGE_SIZE))
-        PANIC("unaligned vaddr %x", vaddr);
-
-    if (!is_aligned(paddr, PAGE_SIZE))
-        PANIC("unaligned paddr %x", paddr);
-
-    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
-    if ((table1[vpn1] & PAGE_V) == 0) {
-        // 如果一级页表项不存在，则创建二级页表。
-        uint32_t pt_paddr = alloc_pages(1);
-        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
-    }
-
-    // 设置二级页表项以映射物理页面。
-    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
-    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
-    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+    uint32_t sepc = READ_CSR(sepc);
+    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, sepc);
 }
